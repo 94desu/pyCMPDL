@@ -1,85 +1,109 @@
-from os import cpu_count,mkdir,getcwd
+from os           import mkdir,getcwd
 from urllib.parse import unquote
-from requests import get as reget
+from pathlib      import Path
+from threading    import Thread,Lock
+from queue        import Queue
+from requests     import get as reget
 import json
-from pathlib import Path
-from threading import Thread,Lock
 
-def do_download(modpack_dir,mulit_thread_on=None,thread_count=None):
-    #pre-set the default parameters
-    if mulit_thread_on is None : mulit_thread_on = True
-    if thread_count is None : thread_count = 4
-    if thread_count > 4 : thread_count = 4
 
-    modpackPath = Path(modpack_dir)
-    if not modpackPath.exists():
-        print('ModPack path not found: "%s"' % str(modpackPath))
-        print('Task end without success!')
-        return
-    manifestPath = modpackPath / 'manifest.json'
-    if not manifestPath.exists():
-        print('"manifest.json" not found in path: "%s"' % str(modpackPath))
-        print('Task end without success!')
-        return
-    mcPath = modpackPath / 'minecraft'   
-    modsPath = mcPath / 'mods'
-    if not mcPath.exists(): mkdir(mcPath)
-    if not modsPath.exists(): mkdir(modsPath)
-    modlist = __get_files_url_list(manifestPath)
+class MobPack_Downloader():
 
-    if mulit_thread_on:
-        modlist_list = []
-        for i in range(thread_count):
-            modlist_list.append(modlist[i::thread_count])
+    def __init__(self,message_handler=None):
+        self.download_lock = Lock()
+        self.logs = []
+        self.message_handler = message_handler if message_handler else self._log
+
+
+    def download_modpack(self,modpack_directory,on_start=None,on_finish=None):
+        modpackPath = Path(modpack_directory)
+        if not modpackPath.exists():
+            self._message('ModPack path not found: "%s"' % str(modpackPath),'error')
+            if on_finish:on_finish()
+            return False
+
+        manifestFile = modpackPath / 'manifest.json'
+        if not manifestFile.exists():
+            self._message('"manifest.json" not found in path: "%s"' % str(modpackPath),'error')
+            if on_finish:on_finish()
+            return False
         
-        ths = []
-        for modl in modlist_list:
-            ths.append(Thread(target=__download_files,args=(modl,modsPath),daemon=True))
+        if on_start:on_start()
+        self._message("Start download mod pack!")
+        self.logs = []
+        manifest = self._read_manifest(manifestFile)
 
-        for th in ths:
-            th.start()
+        # create folder './minecraft/mods' if it's not exists
+        mcPath = modpackPath / 'minecraft'
+        modsFolder = mcPath / 'mods'
+        if not mcPath.exists(): mkdir(mcPath)
+        if not modsFolder.exists(): mkdir(modsFolder)
 
-        for th in ths:
-            th.join()
-    else:
-        __download_files(modlist,modsPath)
-    print('Download has been done!')
+        download_queue = self._get_download_queue(manifest['files'])
+        self.dl_total = download_queue.qsize()
+        self.dl_done = 0
 
-def __download_files(file_url_list,targetPath):
-    for furl in file_url_list:
-        file_resp = reget(furl,stream=True)
-        end_url = file_resp.history[-1].url
-        filePath = Path(end_url)
-        fileName = unquote(filePath.name)
-        if not fileName =='download':
-            with open(str(targetPath / fileName),'wb') as fmod:
-                fmod.write(file_resp.content)
-            print('%s is downloaded!' % fileName)
-        else:
-            print('file not found with url : %s' % end_url)
+        for i in range(4):
+            t = Thread(target = self._download_files, args=(download_queue,modsFolder), daemon=True)
+            t.start()
 
-def __read_manifest(manifest):
-    mf = open(manifest,'r')
-    dic_mf = json.load(mf)
-    mf.close()
-    return dic_mf
+        download_queue.join()
+        self._message("Finish download mod pack!")
+        if on_finish:on_finish()
 
-def __get_files_url_list(manifest):
-    filesurl_prefix = 'https://minecraft.curseforge.com/projects/'
-    dic_m = __read_manifest(manifest)
-    mods_list = []
-    for m in dic_m['files']:
-        if m['required'] == True:
-            mod_url = "%s%s/files/%s/download" % (filesurl_prefix,m['projectID'],m['fileID'])
-            mods_list.append(mod_url)
-    return mods_list
 
-def __do_overrides(overridesPath):
-    if overridesPath.exists():
-        pass
-    else:
-        print('Override directory not found!')
-    pass
+    def _download_files(self,download_queue,targetPath):
+        while not download_queue.empty():
+            # get content(reget() = requests.get())
+            file_resp = reget(download_queue.get(block=False),stream=True)
+
+            # read the final redirection link url 
+            end_url = file_resp.history[-1].url
+
+            # get the file name from end_url
+            filePath = Path(end_url)
+            fileName = unquote(filePath.name)
+            if not fileName =='download':
+                with open(str(targetPath / fileName),'wb') as f:
+                    f.write(file_resp.content)
+                with self.download_lock:
+                    self.dl_done += 1
+                    self._message('[%d/%d] File is downloaded:%s' % (self.dl_done,self.dl_total,fileName))
+            else:
+                with self.download_lock:
+                    self.dl_done += 1
+                    self._message('[%d/%d] File is not found: %s' % (self.dl_done,self.dl_total,end_url),'warning')
+            download_queue.task_done()
+
+    def _get_download_queue(self,files):
+        filesurl_prefix = 'https://minecraft.curseforge.com/projects'
+        dl_queue = Queue()
+        for m in files:
+            mod_url = "%s/%s/files/%s/download" % (filesurl_prefix,m['projectID'],m['fileID'])
+            dl_queue.put(mod_url)
+        return dl_queue
+
+    def _read_manifest(self,manifestFile):
+        with open(manifestFile,'r') as mf:
+            dic_mf = json.load(mf)
+        return dic_mf
+
+
+    def _message(self,message,level=None):
+        level = level if level else 'info'
+        if level not in self._MSG_LEVEL:level = 'info'
+        self.message_handler(message,level)
+
+
+    #default message handler
+    def _log(self,message,level):
+        log_msg = '[%s][%s] %s' % (level.upper(),'timestmap here',message)
+        print(log_msg)
+        self.logs.append(log_msg)
+
+    _MSG_LEVEL = ('debug','info','warning','error')
+
 
 if __name__ == '__main__':
-    do_download(getcwd())
+    dl = MobPack_Downloader()
+    dl.download_modpack(getcwd())
